@@ -23,6 +23,7 @@ pytest==7.4.4
 pytest-asyncio==0.23.3
 
 # Real API Integrations (install when ready)
+anthropic==0.38.0
 openai==1.12.0
 elevenlabs==0.2.27
 twilio==8.13.0

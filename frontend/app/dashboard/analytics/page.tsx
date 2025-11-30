@@ -43,15 +43,19 @@ export default function AnalyticsPage() {
     return <div className="p-6">Loading analytics...</div>;
   }
 
-  const languageData = Object.entries(analytics?.by_language || {}).map(([name, value]) => ({
-    name: name.toUpperCase(),
-    value: value as number
-  }));
+  const languageData = Object.entries(analytics?.by_language || {})
+    .filter(([, value]) => typeof value === 'number' && value > 0)
+    .map(([name, value]) => ({
+      name: name.toUpperCase(),
+      value: value as number
+    }));
 
-  const intentData = Object.entries(analytics?.by_intent || {}).map(([name, value]) => ({
-    name: name.charAt(0).toUpperCase() + name.slice(1),
-    value: value as number
-  }));
+  const intentData = Object.entries(analytics?.by_intent || {})
+    .filter(([, value]) => typeof value === 'number' && value > 0)
+    .map(([name, value]) => ({
+      name: name.charAt(0).toUpperCase() + name.slice(1),
+      value: value as number
+    }));
 
   const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8'];
 
@@ -81,7 +85,10 @@ export default function AnalyticsPage() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {Math.floor((analytics?.average_duration || 0) / 60)}m {Math.floor((analytics?.average_duration || 0) % 60)}s
+              {analytics?.total_calls > 0
+                ? `${Math.floor((analytics?.average_duration || 0) / 60)}m ${Math.floor((analytics?.average_duration || 0) % 60)}s`
+                : '0m 0s'
+              }
             </div>
             <p className="text-xs text-muted-foreground">Per call</p>
           </CardContent>

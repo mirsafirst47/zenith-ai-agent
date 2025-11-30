@@ -1,19 +1,24 @@
-from fastapi import FastAPI, Request
+"""Zenith AI Agent - Main Application"""
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+import os
+
+# Load environment variables FIRST
+load_dotenv()
+
 from app.config import settings
 from app.models.database import engine, Base
-from app.api.routes import voice, dashboard, business
+from app.api.routes import voice, businesses, calls, analytics
 
-# Create tables
+# Create database tables
 Base.metadata.create_all(bind=engine)
 
 # Initialize FastAPI
 app = FastAPI(
-    title="Zenith AI Agent API",
+    title=settings.APP_NAME,
     description="Multilingual AI Phone Agent System",
-    version="1.0.0",
-    docs_url="/docs",
+    version="1.0.0"
 )
 
 # CORS
@@ -27,47 +32,38 @@ app.add_middleware(
 
 # Include routers
 app.include_router(voice.router, prefix="/api/voice", tags=["Voice"])
-app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
-app.include_router(business.router, prefix="/api/business", tags=["Business"])
+app.include_router(businesses.router, prefix="/api/businesses", tags=["Businesses"])
+app.include_router(calls.router, prefix="/api/calls", tags=["Calls"])
+app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"])
 
-# Health check
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "version": "1.0.0",
-        "mode": settings.ENV,
-        "features": {
-            "real_openai": settings.USE_REAL_OPENAI,
-            "real_twilio": settings.USE_REAL_TWILIO,
-            "real_redis": settings.USE_REAL_REDIS
-        }
-    }
+# Initialize Claude if available
+anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+if anthropic_key and anthropic_key != "mock":
+    try:
+        from app.services.claude_service import claude_service
+        if claude_service.is_available:
+            print("✅ Claude AI initialized successfully")
+        else:
+            print("⚠️ Claude service created but not available")
+    except Exception as e:
+        print(f"⚠️ Claude initialization skipped: {e}")
+else:
+    print("ℹ️ Running without Claude (using mock responses)")
 
-# Demo endpoint
-@app.get("/demo")
-async def demo():
-    return {
-        "message": "Zenith AI Agent - Ready to serve!",
-        "endpoints": {
-            "docs": "/docs",
-            "health": "/health",
-            "simulate_call": "/api/voice/test/simulate",
-            "create_business": "/api/business/create",
-            "dashboard_stats": "/api/dashboard/stats?business_id=YOUR_ID"
-        },
-        "status": "All systems operational"
-    }
 
 @app.get("/")
 async def root():
     return {
-        "app": "Zenith AI Phone Agent",
+        "service": settings.APP_NAME,
         "status": "running",
-        "docs": "/docs",
-        "demo": "/demo"
+        "claude_enabled": bool(os.getenv("ANTHROPIC_API_KEY"))
     }
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "claude_available": bool(os.getenv("ANTHROPIC_API_KEY")),
+        "database": "connected"
+    }

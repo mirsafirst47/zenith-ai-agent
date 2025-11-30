@@ -11,7 +11,7 @@ class Call(Base):
     __tablename__ = "calls"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    business_id = Column(String(36), ForeignKey("businesses.id"), nullable=False)
+    business_id = Column(String(36), ForeignKey("businesses.id"), nullable=True)
     call_sid = Column(String(255), unique=True, nullable=False)
     caller_number = Column(String(20), nullable=False)
     direction = Column(String(20))
