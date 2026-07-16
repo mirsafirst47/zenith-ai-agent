@@ -12,6 +12,26 @@ import uuid
 router = APIRouter()
 
 
+def build_business_data(business: Business) -> dict:
+    """Shape a Business row for the orchestrator.
+
+    The in-memory contract keeps a flat "services" key (what the agent
+    speaks about); it is sourced from config.service_catalog in the new
+    generalized schema.
+    """
+    config = business.config or {}
+    return {
+        "id": str(business.id),
+        "name": business.name,
+        "phone_number": business.phone_number,
+        "description": business.description,
+        "business_type": business.business_type,
+        "hours_of_operation": business.hours_of_operation or {},
+        "services": config.get("service_catalog", []),
+        "config": config,
+    }
+
+
 def create_twiml(message: str, gather: bool = True, language: str = "en-US") -> str:
     """Create TwiML response"""
     if gather:
@@ -40,17 +60,7 @@ async def handle_incoming(
     
     # Find business
     business = db.query(Business).filter(Business.phone_number == To).first()
-    business_data = None
-    
-    if business:
-        business_data = {
-            "id": str(business.id),
-            "name": business.name,
-            "phone_number": business.phone_number,
-            "description": business.description,
-            "hours_of_operation": business.hours_of_operation or {},
-            "services": business.services or []
-        }
+    business_data = build_business_data(business) if business else None
     
     # Create call record
     call = Call(
@@ -160,14 +170,7 @@ async def simulate_call(
     if not business:
         return {"error": "Business not found", "phone": business_phone}
     
-    business_data = {
-        "id": str(business.id),
-        "name": business.name,
-        "phone_number": business.phone_number,
-        "description": business.description,
-        "hours_of_operation": business.hours_of_operation or {},
-        "services": business.services or []
-    }
+    business_data = build_business_data(business)
     
     # Create call record
     call = Call(
@@ -193,7 +196,7 @@ async def simulate_call(
 
     # Update call with detected language and other data
     call.detected_language = final_language
-    call.sentiment = result.get("emotion")  # sentiment field stores emotion
+    call.emotion = result.get("emotion")
     call.intent = result.get("intent")
     call.transcript = [
         {"role": "assistant", "content": greeting},
@@ -207,7 +210,7 @@ async def simulate_call(
     print(f"   Call ID: {call.id}")
     print(f"   Business ID: {call.business_id}")
     print(f"   Language: {call.detected_language}")
-    print(f"   Emotion: {call.sentiment}")
+    print(f"   Emotion: {call.emotion}")
     print(f"   Intent: {call.intent}")
     
     # Clean up

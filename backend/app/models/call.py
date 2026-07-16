@@ -18,7 +18,9 @@ class Call(Base):
     status = Column(String(50))
     detected_language = Column(String(10))
     intent = Column(String(100))
-    sentiment = Column(String(20))
+    # Renamed from `sentiment` — this stores the caller's detected emotion
+    # (neutral/happy/frustrated/angry/...), matching the supabase schema.
+    emotion = Column(String(20))
     transcript = Column(SQLiteJSON)
     summary = Column(Text)
     action_taken = Column(String(100))
