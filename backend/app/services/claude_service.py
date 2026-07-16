@@ -20,8 +20,8 @@ class ClaudeService:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         self.client = None
-        self.model = "claude-sonnet-4-20250514"  # Fast & capable
-        # Alternative: "claude-opus-4-1-20250414" for highest quality
+        self.model = "claude-sonnet-5"  # Fast & capable
+        # Alternative: "claude-opus-4-8" for highest quality
         
         if self.api_key and ANTHROPIC_AVAILABLE and self.api_key != "mock":
             self.client = anthropic.Anthropic(api_key=self.api_key)
