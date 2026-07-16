@@ -2,7 +2,6 @@
 staying on hold". Backs the queue_holds table."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime
@@ -10,11 +9,11 @@ from datetime import datetime
 from app.models.database import get_db
 from app.models.queue_hold import QueueHold, QUEUE_HOLD_STATUSES
 from app.models.business import Business
+from app.models.user import User
+from app.api.deps import get_current_user, scoped_business_id, assert_tenant
+from app.services.queue_service import join_queue as join_queue_row, ACTIVE_STATUS
 
 router = APIRouter()
-
-# Statuses that occupy a place in line
-ACTIVE_STATUS = "waiting"
 # Terminal statuses release the position
 TERMINAL_STATUSES = ("expired", "cancelled", "served")
 
@@ -37,45 +36,19 @@ class QueueHoldResponse(BaseModel):
         from_attributes = True
 
 
-def _next_position(db: Session, business_id: str) -> int:
-    current_max = (
-        db.query(func.max(QueueHold.position))
-        .filter(QueueHold.business_id == business_id, QueueHold.status == ACTIVE_STATUS)
-        .scalar()
-    )
-    return (current_max or 0) + 1
-
-
 @router.post("/join", response_model=QueueHoldResponse, status_code=201)
-def join_queue(hold: QueueHoldJoin, db: Session = Depends(get_db)):
-    """Add a caller to the back of a business's queue"""
+def join_queue(
+    hold: QueueHoldJoin,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
+    """Add a caller to the back of a business's queue (idempotent)"""
+    assert_tenant(hold.business_id, user)
     business = db.query(Business).filter(Business.id == hold.business_id).first()
     if not business:
         raise HTTPException(status_code=404, detail="Business not found")
 
-    existing = (
-        db.query(QueueHold)
-        .filter(
-            QueueHold.business_id == hold.business_id,
-            QueueHold.caller_number == hold.caller_number,
-            QueueHold.status == ACTIVE_STATUS,
-        )
-        .first()
-    )
-    if existing:
-        # Idempotent: calling back while already in line returns the
-        # existing hold instead of double-queuing the caller.
-        return existing
-
-    db_hold = QueueHold(
-        business_id=hold.business_id,
-        caller_number=hold.caller_number,
-        position=_next_position(db, hold.business_id),
-        status=ACTIVE_STATUS,
-    )
-    db.add(db_hold)
-    db.commit()
-    db.refresh(db_hold)
+    db_hold, _created = join_queue_row(db, hold.business_id, hold.caller_number)
     return db_hold
 
 
@@ -84,8 +57,10 @@ def list_queue(
     business_id: str,
     status: Optional[str] = None,
     db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
 ):
     """List a business's queue, in line order"""
+    business_id = scoped_business_id(business_id, user)
     query = db.query(QueueHold).filter(QueueHold.business_id == business_id)
     if status:
         query = query.filter(QueueHold.status == status)
@@ -95,7 +70,11 @@ def list_queue(
 
 
 @router.post("/{hold_id}/notify", response_model=QueueHoldResponse)
-def notify_caller(hold_id: str, db: Session = Depends(get_db)):
+def notify_caller(
+    hold_id: str,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
     """Mark a hold notified (it's the caller's turn) and stamp notified_at.
 
     SMS sending goes through the notification service; this endpoint
@@ -105,6 +84,7 @@ def notify_caller(hold_id: str, db: Session = Depends(get_db)):
     hold = db.query(QueueHold).filter(QueueHold.id == hold_id).first()
     if not hold:
         raise HTTPException(status_code=404, detail="Queue hold not found")
+    assert_tenant(hold.business_id, user)
     if hold.status != ACTIVE_STATUS:
         raise HTTPException(status_code=409, detail=f"Cannot notify a hold in status '{hold.status}'")
 
@@ -128,7 +108,12 @@ def notify_caller(hold_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{hold_id}/resolve", response_model=QueueHoldResponse)
-def resolve_hold(hold_id: str, status: str, db: Session = Depends(get_db)):
+def resolve_hold(
+    hold_id: str,
+    status: str,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
     """Close out a hold as served / cancelled / expired"""
     if status not in TERMINAL_STATUSES:
         raise HTTPException(
@@ -138,6 +123,7 @@ def resolve_hold(hold_id: str, status: str, db: Session = Depends(get_db)):
     hold = db.query(QueueHold).filter(QueueHold.id == hold_id).first()
     if not hold:
         raise HTTPException(status_code=404, detail="Queue hold not found")
+    assert_tenant(hold.business_id, user)
     if hold.status in TERMINAL_STATUSES:
         raise HTTPException(status_code=409, detail=f"Hold already resolved as '{hold.status}'")
 

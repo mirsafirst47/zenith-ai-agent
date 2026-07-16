@@ -10,6 +10,32 @@ export const api = axios.create({
   },
 });
 
+// Attach the auth token when one is stored (set by the login flow).
+// Backend runs with AUTH_ENABLED=false in local dev, so absence of a
+// token is fine there.
+api.interceptors.request.use((config) => {
+  if (typeof window !== 'undefined') {
+    const token = localStorage.getItem('zenith_token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+  }
+  return config;
+});
+
+// Auth API - matches backend /api/auth routes
+export const authAPI = {
+  register: (businessId: string, email: string, password: string, fullName?: string) =>
+    api.post('/api/auth/register', {
+      business_id: businessId, email, password, full_name: fullName,
+    }),
+  login: (email: string, password: string) =>
+    api.post('/api/auth/login', { email, password }),
+  me: () => api.get('/api/auth/me'),
+  setToken: (token: string) => localStorage.setItem('zenith_token', token),
+  clearToken: () => localStorage.removeItem('zenith_token'),
+};
+
 // Response interceptor for error handling
 api.interceptors.response.use(
   (response) => response,

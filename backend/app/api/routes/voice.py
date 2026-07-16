@@ -111,7 +111,18 @@ async def process_input(
     call = db.query(Call).filter(Call.call_sid == CallSid).first()
     if call:
         call.detected_language = result.get("language", call.detected_language)
-        
+
+        # Link a booking made during this call, both directions
+        if action == "booking_confirmed" and result.get("data", {}).get("id"):
+            from app.models.booking import Booking
+            call.booking_id = result["data"]["id"]
+            call.action_taken = "booking_created"
+            booking = db.query(Booking).filter(Booking.id == call.booking_id).first()
+            if booking:
+                booking.call_id = call.id
+        elif action == "queue_hold_created":
+            call.action_taken = "queue_hold_created"
+
         # Append to transcript
         transcript = call.transcript or []
         transcript.append({"role": "user", "content": SpeechResult})

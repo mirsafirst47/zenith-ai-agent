@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     # Deepgram STT (optional)
     DEEPGRAM_API_KEY: Optional[str] = None
     
+    # Auth
+    # Set a real secret in .env for anything beyond local dev.
+    SECRET_KEY: str = "dev-only-secret-change-me"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
+    # Escape hatch for local development: set AUTH_ENABLED=false in .env
+    # to run the dashboard without logging in. Defaults to enforced.
+    AUTH_ENABLED: bool = True
+
     # Server
     HOST: str = "0.0.0.0"
     PORT: int = 8000

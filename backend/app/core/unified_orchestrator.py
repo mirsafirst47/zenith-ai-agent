@@ -16,7 +16,9 @@ from app.core.conversation_manager import (
 from app.core.escalation_system import should_escalate
 from app.core.language_detector import language_detector
 from app.integrations.pos_integration import pos_manager, create_order
-from app.integrations.calendar_integration import reservation_manager, make_reservation, lookup_reservation
+from app.models.database import SessionLocal
+from app.services.booking_service import create_booking, find_active_booking
+from app.services.queue_service import join_queue
 
 
 @dataclass
@@ -143,12 +145,15 @@ class UnifiedAgentOrchestrator:
         
         if action == "create_booking":
             return await self._handle_booking(session, entities)
-        
+
         if action == "create_order":
             return await self._handle_order(session, entities)
-        
+
+        if action == "create_queue_hold":
+            return self._handle_queue_hold(session)
+
         if action == "gather_booking_info":
-            return self._prompt_for_booking_info(entities)
+            return self._prompt_for_booking_info(session, entities)
         
         if action == "gather_order_info":
             return {"response": "What would you like to order?", "action": "continue", "data": {}}
@@ -158,54 +163,122 @@ class UnifiedAgentOrchestrator:
         
         return {"response": result.get("response"), "action": "continue", "data": {}}
     
-    async def _handle_booking(self, session: CallSession, entities: Dict) -> Dict[str, Any]:
-        """Create a booking"""
+    def _parse_scheduled_at(self, entities: Dict) -> datetime:
+        """Combine the extracted date/time entities into a datetime."""
+        date_str = str(entities.get("date", "today")).lower()
+        if date_str == "tomorrow":
+            booking_date = datetime.now() + timedelta(days=1)
+        else:  # today / tonight / unparsed weekday phrases fall back to today
+            booking_date = datetime.now()
+
+        time_str = str(entities.get("time", "7:00 PM")).upper().replace(" ", "")
         try:
-            party_size = int(entities.get("party_size", 2))
+            if "PM" in time_str:
+                hour = int(time_str.replace("PM", "").split(":")[0])
+                if hour != 12:
+                    hour += 12
+            else:
+                hour = int(time_str.replace("AM", "").split(":")[0])
+            minute = int(time_str.split(":")[1][:2]) if ":" in time_str else 0
+            booking_time = dt_time(hour, minute)
+        except Exception:
+            booking_time = dt_time(19, 0)
+
+        return datetime.combine(booking_date.date(), booking_time)
+
+    def _match_service_from_conversation(self, session: CallSession, call_sid: str) -> Optional[str]:
+        """Find which catalog service the caller mentioned, if any."""
+        catalog = (session.business_data or {}).get("services") or []
+        if not catalog:
+            return None
+        context = get_conversation_context(call_sid)
+        spoken = " ".join(
+            t.get("content", "").lower()
+            for t in context.get("turns", [])
+            if t.get("role") == "user"
+        )
+        for item in catalog:
+            if str(item).lower() in spoken:
+                return str(item)
+        return None
+
+    async def _handle_booking(self, session: CallSession, entities: Dict) -> Dict[str, Any]:
+        """Create and persist a booking"""
+        try:
             name = entities.get("name", "Guest")
-            
-            # Parse date
-            date_str = entities.get("date", "today").lower()
-            if date_str == "today":
-                booking_date = datetime.now()
-            elif date_str == "tomorrow":
-                booking_date = datetime.now() + timedelta(days=1)
-            else:
-                booking_date = datetime.now()
-            
-            # Parse time
-            time_str = entities.get("time", "7:00 PM").upper().replace(" ", "")
+            scheduled_at = self._parse_scheduled_at(entities)
+            service_type = self._match_service_from_conversation(session, session.call_sid)
+
+            is_restaurant = (session.business_data or {}).get("business_type") == "restaurant"
+            metadata = {}
+            if "party_size" in entities:
+                metadata["party_size"] = int(entities["party_size"])
+
+            db = SessionLocal()
             try:
-                if "PM" in time_str:
-                    hour = int(time_str.replace("PM", "").split(":")[0])
-                    if hour != 12:
-                        hour += 12
-                else:
-                    hour = int(time_str.replace("AM", "").split(":")[0])
-                minute = int(time_str.split(":")[1][:2]) if ":" in time_str else 0
-                booking_time = dt_time(hour, minute)
-            except:
-                booking_time = dt_time(19, 0)
-            
-            # Create reservation
-            result = await make_reservation(
-                business_id=session.business_id,
-                customer_phone=session.caller_number,
-                customer_name=name,
-                date=booking_date,
-                time_slot=booking_time,
-                party_size=party_size
-            )
-            
-            if result["success"]:
-                code = result["confirmation_code"]
-                response = f"Wonderful! I've confirmed your reservation for {party_size} on {booking_date.strftime('%A, %B %d')} at {booking_time.strftime('%I:%M %p')} under {name}. Your confirmation number is {code}. Is there anything else?"
-                return {"response": response, "action": "booking_confirmed", "data": result["reservation"]}
+                booking = create_booking(
+                    db,
+                    business_id=session.business_id,
+                    customer_name=name,
+                    customer_phone=session.caller_number,
+                    scheduled_at=scheduled_at,
+                    service_type=service_type,
+                    status="confirmed",  # confirmed verbally on the call
+                    booking_metadata=metadata,
+                )
+                booking_data = {
+                    "id": booking.id,
+                    "confirmation_code": booking.confirmation_code,
+                    "scheduled_at": booking.scheduled_at.isoformat(),
+                    "service_type": booking.service_type,
+                    "status": booking.status,
+                }
+            finally:
+                db.close()
+
+            when = f"{scheduled_at.strftime('%A, %B %d')} at {scheduled_at.strftime('%I:%M %p')}"
+            code = booking_data["confirmation_code"]
+            if is_restaurant and "party_size" in metadata:
+                what = f"your reservation for {metadata['party_size']}"
+            elif service_type:
+                what = f"your {service_type} appointment"
             else:
-                return {"response": f"That time isn't available. {result['message']}. Would you like another time?", "action": "continue", "data": {}}
-        
+                what = "your appointment"
+            response = (
+                f"Wonderful! I've confirmed {what} on {when} under {name}. "
+                f"Your confirmation number is {code}. Is there anything else?"
+            )
+            return {"response": response, "action": "booking_confirmed", "data": booking_data}
+
         except Exception as e:
-            return {"response": "I'm having trouble with the reservation. What time would you like?", "action": "continue", "data": {"error": str(e)}}
+            print(f"⚠️ Booking persistence failed: {e}")
+            return {"response": "I'm having trouble with the booking. What time would you like?", "action": "continue", "data": {"error": str(e)}}
+
+    def _handle_queue_hold(self, session: CallSession) -> Dict[str, Any]:
+        """Hold the caller's place in line and let them hang up"""
+        try:
+            db = SessionLocal()
+            try:
+                hold, created = join_queue(db, session.business_id, session.caller_number)
+                hold_data = {"id": hold.id, "position": hold.position, "status": hold.status}
+            finally:
+                db.close()
+
+            if created:
+                response = (
+                    f"You're all set — I've held your place in line. You're number {hold_data['position']}. "
+                    "We'll text you at this number when it's your turn, so feel free to hang up."
+                )
+            else:
+                response = (
+                    f"You're already in line — still number {hold_data['position']}. "
+                    "We'll text you when it's your turn."
+                )
+            return {"response": response, "action": "queue_hold_created", "data": hold_data}
+
+        except Exception as e:
+            print(f"⚠️ Queue hold failed: {e}")
+            return {"response": "I'm sorry, I couldn't hold your place just now. Would you like to stay on the line?", "action": "continue", "data": {"error": str(e)}}
     
     async def _handle_order(self, session: CallSession, entities: Dict) -> Dict[str, Any]:
         """Create an order"""
@@ -228,36 +301,46 @@ class UnifiedAgentOrchestrator:
         except Exception as e:
             return {"response": "I'm having trouble with that order. Let me connect you with someone.", "action": "escalate", "data": {}}
     
-    def _prompt_for_booking_info(self, entities: Dict) -> Dict[str, Any]:
-        """Ask for missing booking info"""
-        if "party_size" not in entities:
+    def _prompt_for_booking_info(self, session: CallSession, entities: Dict) -> Dict[str, Any]:
+        """Ask for missing booking info, using the vertical's vocabulary"""
+        is_restaurant = (session.business_data or {}).get("business_type") == "restaurant"
+        noun = "reservation" if is_restaurant else "appointment"
+
+        if is_restaurant and "party_size" not in entities:
             return {"response": "I'd be happy to help with a reservation. How many people?", "action": "continue", "data": {}}
         if "date" not in entities:
-            return {"response": f"Perfect, a table for {entities['party_size']}. What date?", "action": "continue", "data": {}}
+            return {"response": f"I can help with that {noun}. What day works for you?", "action": "continue", "data": {}}
         if "time" not in entities:
             return {"response": "Great! What time works best?", "action": "continue", "data": {}}
         if "name" not in entities:
-            return {"response": "Wonderful! May I have a name for the reservation?", "action": "continue", "data": {}}
-        
+            return {"response": f"Wonderful! May I have a name for the {noun}?", "action": "continue", "data": {}}
+
         return {"action": "create_booking", "data": entities}
-    
+
     async def _handle_cancellation(self, session: CallSession, entities: Dict) -> Dict[str, Any]:
-        """Cancel a reservation"""
+        """Cancel a persisted booking"""
         confirmation = entities.get("confirmation_code")
-        
-        reservation = lookup_reservation(
-            confirmation_code=confirmation,
-            phone=session.caller_number if not confirmation else None
-        )
-        
-        if reservation:
-            from app.integrations.calendar_integration import cancel_reservation
-            result = await cancel_reservation(reservation["id"])
-            
-            if result["success"]:
-                return {"response": "I've cancelled your reservation. Anything else I can help with?", "action": "continue", "data": {}}
-        
-        return {"response": "I couldn't find that reservation. Do you have the confirmation number?", "action": "continue", "data": {}}
+
+        db = SessionLocal()
+        try:
+            booking = find_active_booking(
+                db,
+                business_id=session.business_id,
+                confirmation_code=confirmation,
+                customer_phone=session.caller_number if not confirmation else None,
+            )
+            if booking:
+                booking.status = "cancelled"
+                db.commit()
+                return {
+                    "response": "I've cancelled your booking. Anything else I can help with?",
+                    "action": "continue",
+                    "data": {"cancelled_booking_id": booking.id},
+                }
+        finally:
+            db.close()
+
+        return {"response": "I couldn't find that booking. Do you have the confirmation number?", "action": "continue", "data": {}}
     
     async def handle_call_end(self, call_sid: str, outcome: str = "completed"):
         """Handle call ending"""

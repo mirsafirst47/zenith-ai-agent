@@ -4,11 +4,13 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime
-import secrets
 
 from app.models.database import get_db
 from app.models.booking import Booking, BOOKING_STATUSES
 from app.models.business import Business
+from app.models.user import User
+from app.api.deps import get_current_user, scoped_business_id, assert_tenant
+from app.services.booking_service import create_booking as create_booking_row
 
 router = APIRouter()
 
@@ -53,12 +55,6 @@ class BookingResponse(BaseModel):
         from_attributes = True
 
 
-def _generate_confirmation_code() -> str:
-    """Short, phone-friendly code (no ambiguous 0/O/1/I characters)."""
-    alphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
-    return "".join(secrets.choice(alphabet) for _ in range(6))
-
-
 @router.get("/", response_model=List[BookingResponse])
 def list_bookings(
     business_id: Optional[str] = None,
@@ -66,8 +62,10 @@ def list_bookings(
     upcoming_only: bool = False,
     limit: int = 100,
     db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
 ):
-    """List bookings, optionally filtered by business/status/time"""
+    """List bookings, scoped to the caller's business when auth is on"""
+    business_id = scoped_business_id(business_id, user)
     query = db.query(Booking).order_by(Booking.scheduled_at.asc())
     if business_id:
         query = query.filter(Booking.business_id == business_id)
@@ -79,13 +77,19 @@ def list_bookings(
 
 
 @router.post("/", response_model=BookingResponse, status_code=201)
-def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
+def create_booking(
+    booking: BookingCreate,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
     """Create a booking (pending until confirmed)"""
+    assert_tenant(booking.business_id, user)
     business = db.query(Business).filter(Business.id == booking.business_id).first()
     if not business:
         raise HTTPException(status_code=404, detail="Business not found")
 
-    db_booking = Booking(
+    return create_booking_row(
+        db,
         business_id=booking.business_id,
         call_id=booking.call_id,
         customer_name=booking.customer_name,
@@ -95,29 +99,36 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
         scheduled_at=booking.scheduled_at,
         duration_minutes=booking.duration_minutes,
         status="pending",
-        confirmation_code=_generate_confirmation_code(),
-        booking_metadata=booking.booking_metadata or {},
+        booking_metadata=booking.booking_metadata,
     )
-    db.add(db_booking)
-    db.commit()
-    db.refresh(db_booking)
-    return db_booking
 
 
-@router.get("/{booking_id}", response_model=BookingResponse)
-def get_booking(booking_id: str, db: Session = Depends(get_db)):
+def _get_scoped_booking(booking_id: str, db: Session, user: Optional[User]) -> Booking:
     booking = db.query(Booking).filter(Booking.id == booking_id).first()
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
+    assert_tenant(booking.business_id, user)
     return booking
 
 
+@router.get("/{booking_id}", response_model=BookingResponse)
+def get_booking(
+    booking_id: str,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
+    return _get_scoped_booking(booking_id, db, user)
+
+
 @router.patch("/{booking_id}", response_model=BookingResponse)
-def update_booking(booking_id: str, update: BookingUpdate, db: Session = Depends(get_db)):
+def update_booking(
+    booking_id: str,
+    update: BookingUpdate,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
     """Update booking details or move it through its lifecycle"""
-    booking = db.query(Booking).filter(Booking.id == booking_id).first()
-    if not booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
+    booking = _get_scoped_booking(booking_id, db, user)
 
     if update.status is not None and update.status not in BOOKING_STATUSES:
         raise HTTPException(
@@ -139,11 +150,13 @@ def update_booking(booking_id: str, update: BookingUpdate, db: Session = Depends
 
 
 @router.delete("/{booking_id}", response_model=BookingResponse)
-def cancel_booking(booking_id: str, db: Session = Depends(get_db)):
+def cancel_booking(
+    booking_id: str,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user),
+):
     """Cancel a booking (soft — row is kept with status=cancelled)"""
-    booking = db.query(Booking).filter(Booking.id == booking_id).first()
-    if not booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
+    booking = _get_scoped_booking(booking_id, db, user)
     booking.status = "cancelled"
     db.commit()
     db.refresh(booking)

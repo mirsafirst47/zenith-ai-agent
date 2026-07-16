@@ -57,6 +57,7 @@ class IntentCategory(Enum):
     COMPLAINT = "complaint"
     MODIFICATION = "modification"
     CANCELLATION = "cancellation"
+    QUEUE_HOLD = "queue_hold"
     GENERAL = "general"
     ESCALATION = "escalation"
     PAYMENT = "payment"
@@ -76,6 +77,7 @@ class ConversationContext:
     entities: Dict[str, Any] = field(default_factory=dict)
     turn_count: int = 0
     business_name: str = ""
+    business_type: str = ""
     business_knowledge: Dict[str, Any] = field(default_factory=dict)
     preferred_tone: ConversationTone = ConversationTone.PROFESSIONAL
     started_at: datetime = field(default_factory=datetime.utcnow)
@@ -295,6 +297,7 @@ class IntelligentAgent:
     
     def update_context_with_business(self, context: ConversationContext, business_data: Dict):
         context.business_name = business_data.get("name", "")
+        context.business_type = business_data.get("business_type", "")
         context.business_knowledge = {
             "hours": business_data.get("hours_of_operation", {}),
             "services": business_data.get("services", []),
@@ -357,11 +360,20 @@ class IntelligentAgent:
     def _detect_intent(self, text: str, context: ConversationContext) -> IntentCategory:
         text_lower = text.lower()
         
+        # Checked in order — more specific intents must precede BOOKING
+        # and ORDER, whose keywords are broad: "cancel my appointment"
+        # must hit CANCELLATION before BOOKING's "appointment", and
+        # "don't want to wait" must hit QUEUE_HOLD before ORDER's "want".
         signals = {
-            IntentCategory.BOOKING: ["reservation", "book", "table", "reserve", "appointment"],
-            IntentCategory.ORDER: ["order", "want", "like to have", "can i get", "i'll have"],
+            IntentCategory.QUEUE_HOLD: [
+                "hold my place", "hold my spot", "save my spot", "call me back",
+                "waitlist", "wait list", "put me in line", "get in line",
+                "text me when", "don't want to wait", "rather not wait"
+            ],
             IntentCategory.CANCELLATION: ["cancel", "don't need", "remove"],
             IntentCategory.MODIFICATION: ["change", "modify", "update", "reschedule"],
+            IntentCategory.BOOKING: ["reservation", "book", "table", "reserve", "appointment"],
+            IntentCategory.ORDER: ["order", "want", "like to have", "can i get", "i'll have"],
             IntentCategory.COMPLAINT: ["complaint", "problem", "issue", "wrong", "bad"],
             IntentCategory.INQUIRY: ["what time", "when", "where", "how much", "hours", "menu"],
             IntentCategory.ESCALATION: ["manager", "supervisor", "speak to someone", "real person"]
@@ -373,19 +385,28 @@ class IntelligentAgent:
         
         return context.detected_intent or IntentCategory.GENERAL
     
+    def _required_booking_fields(self, context: ConversationContext) -> List[str]:
+        """Vertical-aware booking requirements: party_size only makes
+        sense for restaurants; every vertical needs date/time/name."""
+        required = ["date", "time", "name"]
+        if context.business_type == "restaurant":
+            required = ["party_size"] + required
+        return required
+
     def _get_follow_up_needs(self, context: ConversationContext, intent: IntentCategory) -> List[str]:
         if intent == IntentCategory.BOOKING:
-            required = ["party_size", "date", "time", "name"]
-            return [f for f in required if f not in context.entities]
+            return [f for f in self._required_booking_fields(context) if f not in context.entities]
         return []
-    
+
     def _determine_action(self, context: ConversationContext, intent: IntentCategory) -> str:
         if intent == IntentCategory.ESCALATION:
             return "escalate_to_human"
-        
+
+        if intent == IntentCategory.QUEUE_HOLD:
+            return "create_queue_hold"
+
         if intent == IntentCategory.BOOKING:
-            required = ["party_size", "date", "time", "name"]
-            if all(k in context.entities for k in required):
+            if all(k in context.entities for k in self._required_booking_fields(context)):
                 return "create_booking"
             return "gather_booking_info"
         

@@ -13,7 +13,7 @@ from app.config import settings
 # bookings, queue_holds, and users.
 import app.models  # noqa: F401
 from app.models.database import engine, Base
-from app.api.routes import voice, businesses, calls, analytics, bookings, queue_holds
+from app.api.routes import voice, businesses, calls, analytics, bookings, queue_holds, auth
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -41,6 +41,7 @@ app.include_router(calls.router, prefix="/api/calls", tags=["Calls"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"])
 app.include_router(bookings.router, prefix="/api/bookings", tags=["Bookings"])
 app.include_router(queue_holds.router, prefix="/api/queue-holds", tags=["Queue Holds"])
+app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
 
 # Initialize Claude if available
 anthropic_key = os.getenv("ANTHROPIC_API_KEY")
