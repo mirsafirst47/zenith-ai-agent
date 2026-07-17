@@ -1,16 +1,15 @@
 """Booking routes — generic appointments across verticals"""
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from typing import List, Optional
-from pydantic import BaseModel
 from datetime import datetime
+from typing import List, Optional
 
-from app.models.database import get_db
-from app.models.booking import Booking, BOOKING_STATUSES
-from app.models.business import Business
-from app.models.user import User
-from app.api.deps import get_current_user, scoped_business_id, assert_tenant
-from app.services.booking_service import create_booking as create_booking_row
+from fastapi import APIRouter, Depends, HTTPException
+from postgrest import AsyncPostgrestClient
+from pydantic import BaseModel
+
+from app.api.deps import AuthContext, assert_tenant, get_auth, get_db
+from app.api.deps import scoped_business_id
+from app.db import repos
+from app.db.repos import BOOKING_STATUSES
 
 router = APIRouter()
 
@@ -51,44 +50,36 @@ class BookingResponse(BaseModel):
     booking_metadata: Optional[dict] = None
     created_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
-
 
 @router.get("/", response_model=List[BookingResponse])
-def list_bookings(
+async def list_bookings(
     business_id: Optional[str] = None,
     status: Optional[str] = None,
     upcoming_only: bool = False,
     limit: int = 100,
-    db: Session = Depends(get_db),
-    user: Optional[User] = Depends(get_current_user),
+    db: AsyncPostgrestClient = Depends(get_db),
+    auth: Optional[AuthContext] = Depends(get_auth),
 ):
     """List bookings, scoped to the caller's business when auth is on"""
-    business_id = scoped_business_id(business_id, user)
-    query = db.query(Booking).order_by(Booking.scheduled_at.asc())
-    if business_id:
-        query = query.filter(Booking.business_id == business_id)
-    if status:
-        query = query.filter(Booking.status == status)
-    if upcoming_only:
-        query = query.filter(Booking.scheduled_at >= datetime.utcnow())
-    return query.limit(limit).all()
+    business_id = scoped_business_id(business_id, auth)
+    return await repos.list_bookings(
+        db, business_id=business_id, status=status, upcoming_only=upcoming_only, limit=limit
+    )
 
 
 @router.post("/", response_model=BookingResponse, status_code=201)
-def create_booking(
+async def create_booking(
     booking: BookingCreate,
-    db: Session = Depends(get_db),
-    user: Optional[User] = Depends(get_current_user),
+    db: AsyncPostgrestClient = Depends(get_db),
+    auth: Optional[AuthContext] = Depends(get_auth),
 ):
     """Create a booking (pending until confirmed)"""
-    assert_tenant(booking.business_id, user)
-    business = db.query(Business).filter(Business.id == booking.business_id).first()
+    assert_tenant(booking.business_id, auth)
+    business = await repos.get_business_by_id(db, booking.business_id)
     if not business:
         raise HTTPException(status_code=404, detail="Business not found")
 
-    return create_booking_row(
+    return await repos.create_booking(
         db,
         business_id=booking.business_id,
         call_id=booking.call_id,
@@ -96,39 +87,39 @@ def create_booking(
         customer_phone=booking.customer_phone,
         service_type=booking.service_type,
         resource=booking.resource,
-        scheduled_at=booking.scheduled_at,
+        scheduled_at=booking.scheduled_at.isoformat(),
         duration_minutes=booking.duration_minutes,
         status="pending",
         booking_metadata=booking.booking_metadata,
     )
 
 
-def _get_scoped_booking(booking_id: str, db: Session, user: Optional[User]) -> Booking:
-    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+async def _get_scoped_booking(booking_id: str, db: AsyncPostgrestClient, auth: Optional[AuthContext]) -> dict:
+    booking = await repos.get_booking(db, booking_id)
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
-    assert_tenant(booking.business_id, user)
+    assert_tenant(booking["business_id"], auth)
     return booking
 
 
 @router.get("/{booking_id}", response_model=BookingResponse)
-def get_booking(
+async def get_booking(
     booking_id: str,
-    db: Session = Depends(get_db),
-    user: Optional[User] = Depends(get_current_user),
+    db: AsyncPostgrestClient = Depends(get_db),
+    auth: Optional[AuthContext] = Depends(get_auth),
 ):
-    return _get_scoped_booking(booking_id, db, user)
+    return await _get_scoped_booking(booking_id, db, auth)
 
 
 @router.patch("/{booking_id}", response_model=BookingResponse)
-def update_booking(
+async def update_booking(
     booking_id: str,
     update: BookingUpdate,
-    db: Session = Depends(get_db),
-    user: Optional[User] = Depends(get_current_user),
+    db: AsyncPostgrestClient = Depends(get_db),
+    auth: Optional[AuthContext] = Depends(get_auth),
 ):
     """Update booking details or move it through its lifecycle"""
-    booking = _get_scoped_booking(booking_id, db, user)
+    booking = await _get_scoped_booking(booking_id, db, auth)
 
     if update.status is not None and update.status not in BOOKING_STATUSES:
         raise HTTPException(
@@ -137,27 +128,24 @@ def update_booking(
         )
 
     changes = update.model_dump(exclude_unset=True)
-    # Rescheduling an already-confirmed booking marks it modified unless
-    # the caller sets an explicit status in the same request.
-    if "scheduled_at" in changes and "status" not in changes and booking.status == "confirmed":
-        changes["status"] = "modified"
+    if "scheduled_at" in changes:
+        changes["scheduled_at"] = changes["scheduled_at"].isoformat()
+        # Rescheduling an already-confirmed booking marks it modified unless
+        # the caller sets an explicit status in the same request.
+        if "status" not in changes and booking["status"] == "confirmed":
+            changes["status"] = "modified"
 
-    for field, value in changes.items():
-        setattr(booking, field, value)
-    db.commit()
-    db.refresh(booking)
-    return booking
+    if not changes:
+        return booking
+    return await repos.update_booking(db, booking_id, changes)
 
 
 @router.delete("/{booking_id}", response_model=BookingResponse)
-def cancel_booking(
+async def cancel_booking(
     booking_id: str,
-    db: Session = Depends(get_db),
-    user: Optional[User] = Depends(get_current_user),
+    db: AsyncPostgrestClient = Depends(get_db),
+    auth: Optional[AuthContext] = Depends(get_auth),
 ):
     """Cancel a booking (soft — row is kept with status=cancelled)"""
-    booking = _get_scoped_booking(booking_id, db, user)
-    booking.status = "cancelled"
-    db.commit()
-    db.refresh(booking)
-    return booking
+    await _get_scoped_booking(booking_id, db, auth)
+    return await repos.update_booking(db, booking_id, {"status": "cancelled"})

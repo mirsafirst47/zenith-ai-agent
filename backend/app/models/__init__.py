@@ -1,19 +1,7 @@
-"""Model registry.
+"""Shared domain constants.
 
-Importing every model here ensures Base.metadata knows about all tables
-before main.py calls Base.metadata.create_all() — previously Booking and
-User were never imported anywhere at startup, so their tables were
-silently never created.
+The SQLAlchemy ORM is gone — the schema now lives in
+supabase/migrations/*.sql and data access in app.db.repos. This package
+keeps the status vocabularies that used to live on the models.
 """
-from .database import Base, engine, SessionLocal, get_db
-from .business import Business
-from .call import Call
-from .booking import Booking, BOOKING_STATUSES
-from .queue_hold import QueueHold, QUEUE_HOLD_STATUSES
-from .user import User
-
-__all__ = [
-    "Base", "engine", "SessionLocal", "get_db",
-    "Business", "Call", "Booking", "BOOKING_STATUSES",
-    "QueueHold", "QUEUE_HOLD_STATUSES", "User",
-]
+from app.db.repos import BOOKING_STATUSES, QUEUE_HOLD_STATUSES  # noqa: F401

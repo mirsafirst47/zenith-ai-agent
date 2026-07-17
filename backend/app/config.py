@@ -11,20 +11,22 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     API_V1_PREFIX: str = "/api"
     
-    # Database
-    # Local dev defaults to SQLite; production points this at the
-    # Supabase Postgres connection string (Settings -> Database -> URI).
-    DATABASE_URL: str = "sqlite:///./zenith.db"
-
     # Supabase (all read from environment / .env — never hardcode)
     SUPABASE_URL: Optional[str] = None
     SUPABASE_ANON_KEY: Optional[str] = None
     SUPABASE_SERVICE_ROLE_KEY: Optional[str] = None
+    # HS256 secret Supabase signs user JWTs with (Dashboard -> Settings
+    # -> API -> JWT Secret). Required to verify dashboard logins.
+    SUPABASE_JWT_SECRET: Optional[str] = None
+    # Override for local testing against a plain PostgREST instance;
+    # in production leave unset (derived from SUPABASE_URL/rest/v1).
+    POSTGREST_URL: Optional[str] = None
     
     # Twilio
     TWILIO_ACCOUNT_SID: Optional[str] = None
     TWILIO_AUTH_TOKEN: Optional[str] = None
     TWILIO_PHONE_NUMBER: Optional[str] = None
+    USE_REAL_TWILIO: bool = False
     
     # OpenAI (optional)
     OPENAI_API_KEY: Optional[str] = None
@@ -41,9 +43,6 @@ class Settings(BaseSettings):
     DEEPGRAM_API_KEY: Optional[str] = None
     
     # Auth
-    # Set a real secret in .env for anything beyond local dev.
-    SECRET_KEY: str = "dev-only-secret-change-me"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
     # Escape hatch for local development: set AUTH_ENABLED=false in .env
     # to run the dashboard without logging in. Defaults to enforced.
     AUTH_ENABLED: bool = True

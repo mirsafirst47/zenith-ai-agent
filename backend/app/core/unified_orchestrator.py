@@ -16,7 +16,7 @@ from app.core.conversation_manager import (
 from app.core.escalation_system import should_escalate
 from app.core.language_detector import language_detector
 from app.integrations.pos_integration import pos_manager, create_order
-from app.models.database import SessionLocal
+from app.db.client import service_client
 from app.services.booking_service import create_booking, find_active_booking
 from app.services.queue_service import join_queue
 
@@ -150,7 +150,7 @@ class UnifiedAgentOrchestrator:
             return await self._handle_order(session, entities)
 
         if action == "create_queue_hold":
-            return self._handle_queue_hold(session)
+            return await self._handle_queue_hold(session)
 
         if action == "gather_booking_info":
             return self._prompt_for_booking_info(session, entities)
@@ -214,27 +214,23 @@ class UnifiedAgentOrchestrator:
             if "party_size" in entities:
                 metadata["party_size"] = int(entities["party_size"])
 
-            db = SessionLocal()
-            try:
-                booking = create_booking(
-                    db,
-                    business_id=session.business_id,
-                    customer_name=name,
-                    customer_phone=session.caller_number,
-                    scheduled_at=scheduled_at,
-                    service_type=service_type,
-                    status="confirmed",  # confirmed verbally on the call
-                    booking_metadata=metadata,
-                )
-                booking_data = {
-                    "id": booking.id,
-                    "confirmation_code": booking.confirmation_code,
-                    "scheduled_at": booking.scheduled_at.isoformat(),
-                    "service_type": booking.service_type,
-                    "status": booking.status,
-                }
-            finally:
-                db.close()
+            booking = await create_booking(
+                service_client(),
+                business_id=session.business_id,
+                customer_name=name,
+                customer_phone=session.caller_number,
+                scheduled_at=scheduled_at.isoformat(),
+                service_type=service_type,
+                status="confirmed",  # confirmed verbally on the call
+                booking_metadata=metadata,
+            )
+            booking_data = {
+                "id": booking["id"],
+                "confirmation_code": booking["confirmation_code"],
+                "scheduled_at": booking["scheduled_at"],
+                "service_type": booking["service_type"],
+                "status": booking["status"],
+            }
 
             when = f"{scheduled_at.strftime('%A, %B %d')} at {scheduled_at.strftime('%I:%M %p')}"
             code = booking_data["confirmation_code"]
@@ -254,15 +250,11 @@ class UnifiedAgentOrchestrator:
             print(f"⚠️ Booking persistence failed: {e}")
             return {"response": "I'm having trouble with the booking. What time would you like?", "action": "continue", "data": {"error": str(e)}}
 
-    def _handle_queue_hold(self, session: CallSession) -> Dict[str, Any]:
+    async def _handle_queue_hold(self, session: CallSession) -> Dict[str, Any]:
         """Hold the caller's place in line and let them hang up"""
         try:
-            db = SessionLocal()
-            try:
-                hold, created = join_queue(db, session.business_id, session.caller_number)
-                hold_data = {"id": hold.id, "position": hold.position, "status": hold.status}
-            finally:
-                db.close()
+            hold, created = await join_queue(service_client(), session.business_id, session.caller_number)
+            hold_data = {"id": hold["id"], "position": hold["position"], "status": hold["status"]}
 
             if created:
                 response = (
@@ -321,24 +313,21 @@ class UnifiedAgentOrchestrator:
         """Cancel a persisted booking"""
         confirmation = entities.get("confirmation_code")
 
-        db = SessionLocal()
-        try:
-            booking = find_active_booking(
-                db,
-                business_id=session.business_id,
-                confirmation_code=confirmation,
-                customer_phone=session.caller_number if not confirmation else None,
-            )
-            if booking:
-                booking.status = "cancelled"
-                db.commit()
-                return {
-                    "response": "I've cancelled your booking. Anything else I can help with?",
-                    "action": "continue",
-                    "data": {"cancelled_booking_id": booking.id},
-                }
-        finally:
-            db.close()
+        db = service_client()
+        booking = await find_active_booking(
+            db,
+            business_id=session.business_id,
+            confirmation_code=confirmation,
+            customer_phone=session.caller_number if not confirmation else None,
+        )
+        if booking:
+            from app.db import repos
+            await repos.update_booking(db, booking["id"], {"status": "cancelled"})
+            return {
+                "response": "I've cancelled your booking. Anything else I can help with?",
+                "action": "continue",
+                "data": {"cancelled_booking_id": booking["id"]},
+            }
 
         return {"response": "I couldn't find that booking. Do you have the confirmation number?", "action": "continue", "data": {}}
     
