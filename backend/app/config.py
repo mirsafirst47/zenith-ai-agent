@@ -12,7 +12,14 @@ class Settings(BaseSettings):
     API_V1_PREFIX: str = "/api"
     
     # Database
+    # Local dev defaults to SQLite; production points this at the
+    # Supabase Postgres connection string (Settings -> Database -> URI).
     DATABASE_URL: str = "sqlite:///./zenith.db"
+
+    # Supabase (all read from environment / .env — never hardcode)
+    SUPABASE_URL: Optional[str] = None
+    SUPABASE_ANON_KEY: Optional[str] = None
+    SUPABASE_SERVICE_ROLE_KEY: Optional[str] = None
     
     # Twilio
     TWILIO_ACCOUNT_SID: Optional[str] = None
