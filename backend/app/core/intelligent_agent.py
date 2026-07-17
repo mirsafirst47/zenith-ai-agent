@@ -371,7 +371,12 @@ class IntelligentAgent:
                 "text me when", "don't want to wait", "rather not wait"
             ],
             IntentCategory.CANCELLATION: ["cancel", "don't need", "remove"],
-            IntentCategory.MODIFICATION: ["change", "modify", "update", "reschedule"],
+            # Anchored phrases: a bare "change"/"update" collides with
+            # service names like "oil change" across verticals
+            IntentCategory.MODIFICATION: [
+                "reschedule", "modify", "change my", "change the", "change our",
+                "move my", "move the", "update my", "push back my", "different time"
+            ],
             IntentCategory.BOOKING: ["reservation", "book", "table", "reserve", "appointment"],
             IntentCategory.ORDER: ["order", "want", "like to have", "can i get", "i'll have"],
             IntentCategory.COMPLAINT: ["complaint", "problem", "issue", "wrong", "bad"],
@@ -386,12 +391,13 @@ class IntelligentAgent:
         return context.detected_intent or IntentCategory.GENERAL
     
     def _required_booking_fields(self, context: ConversationContext) -> List[str]:
-        """Vertical-aware booking requirements: party_size only makes
-        sense for restaurants; every vertical needs date/time/name."""
-        required = ["date", "time", "name"]
-        if context.business_type == "restaurant":
-            required = ["party_size"] + required
-        return required
+        """Config-driven booking requirements (config.booking_fields),
+        resolved by the knowledge base with sane per-vertical defaults."""
+        from app.core.knowledge_base import knowledge_manager
+        kb = knowledge_manager.get_knowledge_base(context.business_id)
+        if kb and kb.booking_fields:
+            return kb.booking_fields
+        return ["date", "time", "name"]
 
     def _get_follow_up_needs(self, context: ConversationContext, intent: IntentCategory) -> List[str]:
         if intent == IntentCategory.BOOKING:
@@ -511,17 +517,23 @@ RULES:
     
     def _booking_response(self, context: ConversationContext) -> str:
         e = context.entities
-        
-        if "party_size" not in e:
-            return "I'd be happy to help with a reservation. How many people will be in your party?"
-        if "date" not in e:
-            return f"Perfect, a table for {e['party_size']}. What date were you thinking?"
-        if "time" not in e:
-            return f"Great! And what time works best for you?"
-        if "name" not in e:
-            return "Wonderful! May I have a name for the reservation?"
-        
-        return f"Let me confirm: {e['party_size']} guests on {e['date']} at {e['time']} under {e['name']}. Is that correct?"
+        noun = "reservation" if context.business_type == "restaurant" else "appointment"
+
+        for field in self._required_booking_fields(context):
+            if field not in e:
+                prompts = {
+                    "party_size": f"I'd be happy to help with a {noun}. How many people will be in your party?",
+                    "date": f"I can help with that {noun}. What day works for you?",
+                    "time": "Great! And what time works best for you?",
+                    "name": f"Wonderful! May I have a name for the {noun}?",
+                    "service_type": "Of course — which service would you like to book?",
+                    "vehicle": "Sure — what's the year, make, and model of your vehicle?",
+                }
+                return prompts.get(field, f"Could I get the {field.replace('_', ' ')} for the {noun}?")
+
+        summary = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in e.items()
+                            if k in self._required_booking_fields(context))
+        return f"Let me confirm your {noun} — {summary}. Is that correct?"
     
     def _inquiry_response(self, context: ConversationContext, text: str) -> str:
         text_lower = text.lower()
@@ -550,5 +562,8 @@ intelligent_agent = IntelligentAgent()
 async def get_intelligent_response(call_sid: str, user_text: str,
                                    business_data: Optional[Dict] = None,
                                    language: str = "en") -> Dict[str, Any]:
-    context = intelligent_agent.get_or_create_context(call_sid, language=language)
+    business_id = (business_data or {}).get("id", "")
+    context = intelligent_agent.get_or_create_context(call_sid, business_id=business_id, language=language)
+    if business_id and not context.business_id:
+        context.business_id = business_id
     return await intelligent_agent.process_input(call_sid, user_text, business_data)

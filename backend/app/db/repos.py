@@ -7,7 +7,7 @@ the same shape the REST API responses use.
 """
 import random
 import string
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from postgrest import AsyncPostgrestClient
@@ -266,3 +266,43 @@ async def waiting_holds_after(
         .execute()
     )
     return res.data
+
+
+async def count_overlapping_bookings(
+    db: AsyncPostgrestClient,
+    business_id: str,
+    start_iso: str,
+    end_iso: str,
+) -> int:
+    """Active bookings whose [scheduled_at, +duration) window overlaps
+    [start, end). Overlap test: existing.start < new.end AND
+    existing.end > new.start — duration isn't queryable arithmetic via
+    PostgREST, so fetch the narrow candidate window and finish in Python."""
+    res = (
+        await db.from_("bookings")
+        .select("scheduled_at,duration_minutes")
+        .eq("business_id", business_id)
+        .in_("status", ["pending", "confirmed", "modified"])
+        .lt("scheduled_at", end_iso)
+        .gte("scheduled_at", _shift_iso(start_iso, minutes=-24 * 60))
+        .execute()
+    )
+    start = _aware(datetime.fromisoformat(start_iso.replace("Z", "+00:00")))
+    end = _aware(datetime.fromisoformat(end_iso.replace("Z", "+00:00")))
+    count = 0
+    for row in res.data:
+        b_start = _aware(datetime.fromisoformat(row["scheduled_at"].replace("Z", "+00:00")))
+        b_end = b_start + timedelta(minutes=row.get("duration_minutes") or 60)
+        if b_start < end and b_end > start:
+            count += 1
+    return count
+
+
+def _aware(dt: datetime) -> datetime:
+    """Treat naive datetimes as UTC so comparisons never mix tz-ness."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _shift_iso(iso: str, minutes: int) -> str:
+    dt = _aware(datetime.fromisoformat(iso.replace("Z", "+00:00")))
+    return (dt + timedelta(minutes=minutes)).isoformat()

@@ -1,9 +1,14 @@
 """
 ZENITH AI AGENT - BUSINESS KNOWLEDGE BASE
-Stores menus, hours, policies for intelligent responses.
-"""
+Vertical-neutral store of what the agent knows about a business:
+service catalog, hours, capacity, policies, specials, FAQ.
 
-import json
+Everything loads from the business row's `config` JSON — the same
+conventional keys documented in the businesses migration:
+service_catalog, appointment_capacity, faq, policies, specials.
+A new vertical never needs code changes, only different config.
+"""
+import re
 from typing import Optional, Dict, List, Any
 from datetime import datetime, time, timedelta
 from dataclasses import dataclass, field
@@ -21,15 +26,26 @@ class DayOfWeek(Enum):
 
 
 @dataclass
-class MenuItem:
+class ServiceCatalogItem:
+    """One thing a business offers: a salon service, a mechanic job, a
+    clinic procedure, a menu item. Formerly restaurant-only MenuItem."""
     id: str
     name: str
-    description: str
-    price: float
-    category: str
+    description: str = ""
+    price: Optional[float] = None
+    duration_minutes: Optional[int] = None
+    category: str = "general"
     available: bool = True
-    dietary_info: List[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)  # e.g. dietary info, "walk-in ok"
     popular: bool = False
+
+    def to_spoken(self) -> str:
+        parts = [self.name]
+        if self.price is not None:
+            parts.append(f"${self.price:g}")
+        if self.duration_minutes:
+            parts.append(f"about {self.duration_minutes} minutes")
+        return " — ".join(parts)
 
 
 @dataclass
@@ -37,12 +53,12 @@ class BusinessHours:
     open_time: time
     close_time: time
     is_closed: bool = False
-    
+
     def is_open_at(self, check_time: time) -> bool:
         if self.is_closed:
             return False
         return self.open_time <= check_time <= self.close_time
-    
+
     def to_string(self) -> str:
         if self.is_closed:
             return "Closed"
@@ -66,48 +82,64 @@ class SpecialOffer:
     valid_from: datetime
     valid_until: datetime
     conditions: str
-    
+
     def is_active(self) -> bool:
         now = datetime.utcnow()
         return self.valid_from <= now <= self.valid_until
-    
+
     def to_spoken(self) -> str:
         if self.discount_type == "percentage":
             return f"{self.name}: {int(self.discount_value)}% off. {self.conditions}"
         return f"{self.name}: {self.description}"
 
 
+@dataclass
+class AppointmentCapacity:
+    """How many things can happen at once, vertical-neutral.
+
+    - max_concurrent: bays for a mechanic, chairs for a salon, exam
+      rooms for a clinic, tables (roughly) for a restaurant.
+    - max_party_size: only meaningful where bookings have a headcount
+      (restaurants). None = this vertical doesn't collect party size.
+    """
+    max_concurrent: int = 10
+    max_party_size: Optional[int] = None
+
+
 class BusinessKnowledgeBase:
     """Central repository for business information"""
-    
+
     def __init__(self, business_id: str):
         self.business_id = business_id
         self.business_name = ""
-        self.business_type = "restaurant"
+        self.business_type = ""
         self.location = ""
         self.phone = ""
         self.description = ""
-        
+
         self.hours: Dict[DayOfWeek, BusinessHours] = {}
-        self.menu_items: Dict[str, MenuItem] = {}
+        self.catalog: Dict[str, ServiceCatalogItem] = {}
         self.policies: List[Policy] = []
         self.specials: List[SpecialOffer] = []
-        
-        self.total_capacity = 50
-        self.max_party_size = 10
+        self.capacity = AppointmentCapacity()
         self.faq: Dict[str, str] = {}
+        self.booking_fields: List[str] = []
         self._popular_items: List[str] = []
-    
+
+    # ------------------------------------------------------------ loading
+
     def load_from_dict(self, data: Dict[str, Any]):
-        """Load business data from dictionary"""
+        """Load from a business row shaped by voice.build_business_data
+        (top-level fields + the raw config dict)."""
         self.business_name = data.get("name", "")
-        self.business_type = data.get("type", "restaurant")
+        self.business_type = data.get("business_type", data.get("type", ""))
         self.location = data.get("location", "")
         self.phone = data.get("phone_number", "")
-        self.description = data.get("description", "")
-        
-        # Load hours
-        hours_data = data.get("hours_of_operation", {})
+        self.description = data.get("description", "") or ""
+
+        config = data.get("config") or {}
+
+        hours_data = data.get("hours_of_operation", {}) or {}
         for day_name, hours in hours_data.items():
             try:
                 day = DayOfWeek[day_name.upper()]
@@ -117,55 +149,88 @@ class BusinessKnowledgeBase:
                     open_t = self._parse_time(hours.get("open", "09:00"))
                     close_t = self._parse_time(hours.get("close", "21:00"))
                     self.hours[day] = BusinessHours(open_t, close_t)
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, AttributeError):
                 continue
-        
-        # Load menu
-        for item_data in data.get("menu_items", []):
-            item = MenuItem(
-                id=item_data.get("id", str(len(self.menu_items))),
-                name=item_data.get("name", ""),
-                description=item_data.get("description", ""),
-                price=float(item_data.get("price", 0)),
-                category=item_data.get("category", "main"),
-                available=item_data.get("available", True),
-                dietary_info=item_data.get("dietary_info", []),
-                popular=item_data.get("popular", False)
-            )
-            self.menu_items[item.id] = item
-        
-        # Load policies
-        for policy_data in data.get("policies", []):
+
+        for raw in config.get("service_catalog", []):
+            item = self._parse_catalog_item(raw)
+            if item:
+                self.catalog[item.id] = item
+
+        for policy_data in config.get("policies", []):
             if isinstance(policy_data, dict):
                 self.policies.append(Policy(
                     name=policy_data.get("name", ""),
                     description=policy_data.get("description", ""),
-                    category=policy_data.get("category", "general")
+                    category=policy_data.get("category", "general"),
                 ))
-        
-        # Load specials
-        for special_data in data.get("specials", []):
+
+        for special_data in config.get("specials", []):
             if isinstance(special_data, dict):
-                self.specials.append(SpecialOffer(
-                    id=special_data.get("id", str(len(self.specials))),
-                    name=special_data.get("name", ""),
-                    description=special_data.get("description", ""),
-                    discount_type=special_data.get("discount_type", "percentage"),
-                    discount_value=float(special_data.get("discount_value", 0)),
-                    valid_from=datetime.fromisoformat(special_data.get("valid_from", datetime.utcnow().isoformat())),
-                    valid_until=datetime.fromisoformat(special_data.get("valid_until", (datetime.utcnow() + timedelta(days=30)).isoformat())),
-                    conditions=special_data.get("conditions", "")
-                ))
-        
-        # Capacity
-        capacity = data.get("capacity", {})
-        if isinstance(capacity, dict):
-            self.total_capacity = capacity.get("total", 50)
-            self.max_party_size = capacity.get("max_party", 10)
-        
-        self.faq = data.get("faq", {})
+                try:
+                    self.specials.append(SpecialOffer(
+                        id=special_data.get("id", str(len(self.specials))),
+                        name=special_data.get("name", ""),
+                        description=special_data.get("description", ""),
+                        discount_type=special_data.get("discount_type", "percentage"),
+                        discount_value=float(special_data.get("discount_value", 0)),
+                        valid_from=datetime.fromisoformat(special_data.get("valid_from", datetime.utcnow().isoformat())),
+                        valid_until=datetime.fromisoformat(special_data.get("valid_until", (datetime.utcnow() + timedelta(days=30)).isoformat())),
+                        conditions=special_data.get("conditions", ""),
+                    ))
+                except (ValueError, TypeError):
+                    continue
+
+        cap = config.get("appointment_capacity") or {}
+        if isinstance(cap, dict):
+            self.capacity = AppointmentCapacity(
+                max_concurrent=int(cap.get("max_concurrent", 10)),
+                max_party_size=cap.get("max_party_size"),
+            )
+        elif isinstance(cap, int):
+            self.capacity = AppointmentCapacity(max_concurrent=cap)
+
+        self.faq = {str(k): str(v) for k, v in (config.get("faq") or {}).items()}
+        self.booking_fields = self._resolve_booking_fields(config)
         self._build_caches()
-    
+
+    def _parse_catalog_item(self, raw: Any) -> Optional[ServiceCatalogItem]:
+        """Accept both bare strings ("oil change") and rich dicts."""
+        if isinstance(raw, str):
+            return ServiceCatalogItem(id=self._slug(raw), name=raw)
+        if isinstance(raw, dict):
+            name = raw.get("name", "")
+            if not name:
+                return None
+            price = raw.get("price")
+            return ServiceCatalogItem(
+                id=raw.get("id") or self._slug(name),
+                name=name,
+                description=raw.get("description", ""),
+                price=float(price) if price is not None else None,
+                duration_minutes=raw.get("duration_minutes"),
+                category=raw.get("category", "general"),
+                available=raw.get("available", True),
+                tags=raw.get("tags", raw.get("dietary_info", [])),
+                popular=raw.get("popular", False),
+            )
+        return None
+
+    def _resolve_booking_fields(self, config: Dict) -> List[str]:
+        """What the agent must collect to book. Config-driven, with a
+        back-compat default: restaurants also collect party_size."""
+        fields = config.get("booking_fields")
+        if isinstance(fields, list) and fields:
+            return [str(f) for f in fields]
+        base = ["date", "time", "name"]
+        if self.business_type == "restaurant" or self.capacity.max_party_size:
+            return ["party_size"] + base
+        return base
+
+    @staticmethod
+    def _slug(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
     def _parse_time(self, time_str: str) -> time:
         try:
             if ":" in time_str:
@@ -174,22 +239,24 @@ class BusinessKnowledgeBase:
                     return datetime.strptime(parts, "%I:%M%p").time()
                 return datetime.strptime(time_str, "%H:%M").time()
             return time(int(time_str), 0)
-        except:
+        except (ValueError, TypeError):
             return time(9, 0)
-    
+
     def _build_caches(self):
         self._popular_items = [
-            item.name for item in self.menu_items.values()
+            item.name for item in self.catalog.values()
             if item.popular and item.available
         ]
-    
+
+    # ------------------------------------------------------------ queries
+
     def is_open_now(self) -> bool:
         now = datetime.now()
         today = DayOfWeek(now.weekday())
         if today not in self.hours:
             return True
         return self.hours[today].is_open_at(now.time())
-    
+
     def get_hours_today(self) -> str:
         today = DayOfWeek(datetime.now().weekday())
         if today not in self.hours:
@@ -198,45 +265,51 @@ class BusinessKnowledgeBase:
         if hours.is_closed:
             return "We're closed today."
         return f"We're open from {hours.to_string()} today."
-    
+
     def get_popular_items(self, count: int = 3) -> List[str]:
         return self._popular_items[:count]
-    
-    def get_items_by_category(self, category: str) -> List[MenuItem]:
-        return [i for i in self.menu_items.values() 
+
+    def get_items_by_category(self, category: str) -> List[ServiceCatalogItem]:
+        return [i for i in self.catalog.values()
                 if i.category.lower() == category.lower() and i.available]
-    
-    def get_dietary_options(self, dietary_type: str) -> List[MenuItem]:
-        return [i for i in self.menu_items.values()
-                if i.available and dietary_type.lower() in [d.lower() for d in i.dietary_info]]
-    
+
+    def find_item(self, spoken_text: str) -> Optional[ServiceCatalogItem]:
+        """Match a catalog item mentioned anywhere in the caller's speech."""
+        text = spoken_text.lower()
+        for item in self.catalog.values():
+            if item.available and item.name.lower() in text:
+                return item
+        return None
+
     def get_active_specials(self) -> List[SpecialOffer]:
         return [s for s in self.specials if s.is_active()]
-    
+
     def get_policy(self, category: str) -> Optional[Policy]:
         for policy in self.policies:
             if policy.category.lower() == category.lower():
                 return policy
         return None
-    
+
     def get_cancellation_policy(self) -> str:
         policy = self.get_policy("cancellation")
         if policy:
             return policy.description
         return "We ask for 24 hours notice for cancellations."
-    
+
     def answer_faq(self, question: str) -> Optional[str]:
         question_lower = question.lower()
         if question_lower in self.faq:
             return self.faq[question_lower]
-        
+
+        best, best_overlap = None, 0
+        q_words = set(re.findall(r"\w+", question_lower))
         for faq_q, answer in self.faq.items():
-            faq_words = set(faq_q.lower().split())
-            q_words = set(question_lower.split())
-            if len(faq_words & q_words) >= 2:
-                return answer
-        return None
-    
+            faq_words = set(re.findall(r"\w+", faq_q.lower()))
+            overlap = len(faq_words & q_words)
+            if overlap >= 2 and overlap > best_overlap:
+                best, best_overlap = answer, overlap
+        return best
+
     def to_context_dict(self) -> Dict[str, Any]:
         return {
             "name": self.business_name,
@@ -244,22 +317,26 @@ class BusinessKnowledgeBase:
             "location": self.location,
             "hours_today": self.get_hours_today(),
             "is_open_now": self.is_open_now(),
+            "catalog": [i.to_spoken() for i in self.catalog.values() if i.available],
             "popular_items": self.get_popular_items(5),
             "active_specials": [s.to_spoken() for s in self.get_active_specials()],
-            "max_party_size": self.max_party_size,
-            "cancellation_policy": self.get_cancellation_policy()
+            "max_concurrent_appointments": self.capacity.max_concurrent,
+            "max_party_size": self.capacity.max_party_size,
+            "cancellation_policy": self.get_cancellation_policy(),
+            "faq": self.faq,
+            "booking_fields": self.booking_fields,
         }
 
 
 class KnowledgeBaseManager:
     """Manages knowledge bases for multiple businesses"""
-    
+
     def __init__(self):
         self._knowledge_bases: Dict[str, BusinessKnowledgeBase] = {}
-    
+
     def get_knowledge_base(self, business_id: str) -> Optional[BusinessKnowledgeBase]:
         return self._knowledge_bases.get(business_id)
-    
+
     def create_knowledge_base(self, business_id: str, business_data: Dict) -> BusinessKnowledgeBase:
         kb = BusinessKnowledgeBase(business_id)
         kb.load_from_dict(business_data)
@@ -271,50 +348,24 @@ class KnowledgeBaseManager:
 knowledge_manager = KnowledgeBaseManager()
 
 
-# Sample data for testing
-SAMPLE_RESTAURANT = {
-    "name": "Bella Notte Italian Kitchen",
-    "type": "restaurant",
-    "location": "123 Main Street, Downtown",
-    "phone_number": "+15555551234",
-    "description": "Authentic Italian cuisine",
-    "hours_of_operation": {
-        "monday": {"open": "11:00", "close": "22:00"},
-        "tuesday": {"open": "11:00", "close": "22:00"},
-        "wednesday": {"open": "11:00", "close": "22:00"},
-        "thursday": {"open": "11:00", "close": "23:00"},
-        "friday": {"open": "11:00", "close": "23:00"},
-        "saturday": {"open": "10:00", "close": "23:00"},
-        "sunday": {"open": "10:00", "close": "21:00"}
-    },
-    "menu_items": [
-        {"id": "1", "name": "Margherita Pizza", "description": "Classic tomato, mozzarella, basil", 
-         "price": 16.99, "category": "pizza", "popular": True, "dietary_info": ["vegetarian"]},
-        {"id": "2", "name": "Spaghetti Carbonara", "description": "Creamy egg sauce with pancetta", 
-         "price": 18.99, "category": "pasta", "popular": True},
-        {"id": "3", "name": "Caesar Salad", "description": "Romaine, parmesan, croutons", 
-         "price": 12.99, "category": "salad", "dietary_info": ["vegetarian"]},
-        {"id": "4", "name": "Tiramisu", "description": "Classic Italian dessert", 
-         "price": 9.99, "category": "dessert", "popular": True}
-    ],
-    "policies": [
-        {"name": "Cancellation", "description": "4 hours notice required. $25 fee for late cancellations on parties of 6+.", "category": "cancellation"},
-        {"name": "Large Parties", "description": "Parties of 8+ require credit card to hold reservation.", "category": "large_party"}
-    ],
-    "specials": [
-        {"id": "1", "name": "Happy Hour", "description": "Half-price apps and $5 wine",
-         "discount_type": "percentage", "discount_value": 50,
-         "valid_from": "2024-01-01T00:00:00", "valid_until": "2025-12-31T23:59:59",
-         "conditions": "Mon-Fri 4-6pm"}
-    ],
-    "capacity": {"total": 80, "max_party": 12},
-    "faq": {
-        "do you have parking": "Yes, free parking behind the restaurant.",
-        "do you take reservations": "Yes! Call or book online.",
-        "is there outdoor seating": "Yes, patio seats 20 guests."
-    }
-}
-
-
 def create_sample_knowledge_base() -> BusinessKnowledgeBase:
-    return knowledge_manager.create_knowledge_base("sample-restaurant", SAMPLE_RESTAURANT)
+    """Sample KB used by dev/test scripts — a mechanic, deliberately,
+    to keep restaurant assumptions from creeping back in."""
+    kb = BusinessKnowledgeBase("sample")
+    kb.load_from_dict({
+        "name": "Sample Auto Care",
+        "business_type": "mechanic",
+        "config": {
+            "service_catalog": [
+                {"name": "Oil Change", "price": 49.99, "duration_minutes": 30, "popular": True},
+                {"name": "Brake Inspection", "price": 0, "duration_minutes": 45},
+                {"name": "Tire Rotation", "price": 29.99, "duration_minutes": 30},
+            ],
+            "appointment_capacity": {"max_concurrent": 3},
+            "faq": {
+                "do you take walk-ins": "Yes, walk-ins are welcome before 3pm on weekdays.",
+                "do you offer loaner cars": "We don't offer loaners, but we're next to the light rail.",
+            },
+        },
+    })
+    return kb

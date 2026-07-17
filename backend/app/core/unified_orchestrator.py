@@ -188,19 +188,17 @@ class UnifiedAgentOrchestrator:
 
     def _match_service_from_conversation(self, session: CallSession, call_sid: str) -> Optional[str]:
         """Find which catalog service the caller mentioned, if any."""
-        catalog = (session.business_data or {}).get("services") or []
-        if not catalog:
+        kb = knowledge_manager.get_knowledge_base(session.business_id)
+        if not kb or not kb.catalog:
             return None
         context = get_conversation_context(call_sid)
         spoken = " ".join(
-            t.get("content", "").lower()
+            t.get("content", "")
             for t in context.get("turns", [])
             if t.get("role") == "user"
         )
-        for item in catalog:
-            if str(item).lower() in spoken:
-                return str(item)
-        return None
+        item = kb.find_item(spoken)
+        return item.name if item else None
 
     async def _handle_booking(self, session: CallSession, entities: Dict) -> Dict[str, Any]:
         """Create and persist a booking"""
@@ -208,6 +206,31 @@ class UnifiedAgentOrchestrator:
             name = entities.get("name", "Guest")
             scheduled_at = self._parse_scheduled_at(entities)
             service_type = self._match_service_from_conversation(session, session.call_sid)
+
+            # Capacity: verticals have finite bays/chairs/rooms/tables
+            kb = knowledge_manager.get_knowledge_base(session.business_id)
+            duration = 60
+            if kb:
+                item = kb.catalog.get(kb._slug(service_type)) if service_type else None
+                if item and item.duration_minutes:
+                    duration = item.duration_minutes
+                from app.db import repos as _repos
+                overlapping = await _repos.count_overlapping_bookings(
+                    service_client(),
+                    session.business_id,
+                    scheduled_at.isoformat(),
+                    (scheduled_at + timedelta(minutes=duration)).isoformat(),
+                )
+                if overlapping >= kb.capacity.max_concurrent:
+                    when = scheduled_at.strftime("%I:%M %p")
+                    return {
+                        "response": (
+                            f"I'm sorry, we're fully booked around {when}. "
+                            "Is there another time that could work for you?"
+                        ),
+                        "action": "continue",
+                        "data": {"reason": "capacity_full"},
+                    }
 
             is_restaurant = (session.business_data or {}).get("business_type") == "restaurant"
             metadata = {}
@@ -221,6 +244,7 @@ class UnifiedAgentOrchestrator:
                 customer_phone=session.caller_number,
                 scheduled_at=scheduled_at.isoformat(),
                 service_type=service_type,
+                duration_minutes=duration,
                 status="confirmed",  # confirmed verbally on the call
                 booking_metadata=metadata,
             )
@@ -294,18 +318,25 @@ class UnifiedAgentOrchestrator:
             return {"response": "I'm having trouble with that order. Let me connect you with someone.", "action": "escalate", "data": {}}
     
     def _prompt_for_booking_info(self, session: CallSession, entities: Dict) -> Dict[str, Any]:
-        """Ask for missing booking info, using the vertical's vocabulary"""
+        """Ask for missing booking info — one field at a time, in the
+        order the business's config asks for them."""
         is_restaurant = (session.business_data or {}).get("business_type") == "restaurant"
         noun = "reservation" if is_restaurant else "appointment"
 
-        if is_restaurant and "party_size" not in entities:
-            return {"response": "I'd be happy to help with a reservation. How many people?", "action": "continue", "data": {}}
-        if "date" not in entities:
-            return {"response": f"I can help with that {noun}. What day works for you?", "action": "continue", "data": {}}
-        if "time" not in entities:
-            return {"response": "Great! What time works best?", "action": "continue", "data": {}}
-        if "name" not in entities:
-            return {"response": f"Wonderful! May I have a name for the {noun}?", "action": "continue", "data": {}}
+        kb = knowledge_manager.get_knowledge_base(session.business_id)
+        required = kb.booking_fields if kb and kb.booking_fields else ["date", "time", "name"]
+        prompts = {
+            "party_size": f"I'd be happy to help with a {noun}. How many people?",
+            "date": f"I can help with that {noun}. What day works for you?",
+            "time": "Great! What time works best?",
+            "name": f"Wonderful! May I have a name for the {noun}?",
+            "service_type": "Of course — which service would you like to book?",
+            "vehicle": "Sure — what's the year, make, and model of your vehicle?",
+        }
+        for field in required:
+            if field not in entities:
+                message = prompts.get(field, f"Could I get the {field.replace('_', ' ')} for the {noun}?")
+                return {"response": message, "action": "continue", "data": {}}
 
         return {"action": "create_booking", "data": entities}
 
