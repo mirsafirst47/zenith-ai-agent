@@ -72,5 +72,7 @@ async def health():
     return {
         "status": "healthy",
         "claude_available": bool(os.getenv("ANTHROPIC_API_KEY")),
-        "database": "connected"
+        "database": "connected",
+        # Lets the frontend decide whether to require a login
+        "auth_enabled": settings.AUTH_ENABLED,
     }

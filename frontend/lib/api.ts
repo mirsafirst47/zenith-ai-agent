@@ -42,6 +42,19 @@ api.interceptors.response.use(
   (error) => {
     if (error.response) {
       console.error('API Error:', error.response.status, error.response.data);
+      // Session expired or revoked: clear the stale token and send the
+      // user to login. Auth endpoints are excluded — a 401 there is a
+      // normal wrong-password (or auth-disabled /me) response, not an
+      // expired session.
+      if (
+        error.response.status === 401 &&
+        typeof window !== 'undefined' &&
+        !error.config?.url?.includes('/api/auth/') &&
+        window.location.pathname !== '/login'
+      ) {
+        localStorage.removeItem('zenith_token');
+        window.location.href = '/login';
+      }
     } else if (error.request) {
       console.error('API Error: No response received - is backend running?');
     } else {

@@ -1,9 +1,10 @@
 'use client';
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { Phone, BarChart3, Settings, Home, FileText } from "lucide-react";
+import { Phone, BarChart3, Settings, Home, FileText, LogOut } from "lucide-react";
+import { authAPI } from "@/lib/api";
 
 const navigation = [
   { name: 'Overview', href: '/dashboard', icon: Home },
@@ -15,6 +16,12 @@ const navigation = [
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
+
+  const handleLogout = () => {
+    authAPI.clearToken();
+    router.push('/login');
+  };
 
   return (
     <div className="flex flex-col w-64 bg-gray-900 h-screen">
@@ -46,7 +53,14 @@ export default function Sidebar() {
         })}
       </nav>
 
-      <div className="p-4 border-t border-gray-800">
+      <div className="p-4 border-t border-gray-800 space-y-3">
+        <button
+          onClick={handleLogout}
+          className="flex w-full items-center px-4 py-2 text-sm font-medium rounded-lg text-gray-300 hover:bg-gray-800 hover:text-white transition-colors"
+        >
+          <LogOut className="h-5 w-5 mr-3" />
+          Sign out
+        </button>
         <div className="text-xs text-gray-400">
           <p>Zenith AI Agent v1.0</p>
           <p className="mt-1">Status: 🟢 Active</p>
