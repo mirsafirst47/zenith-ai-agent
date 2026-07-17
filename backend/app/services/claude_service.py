@@ -180,20 +180,44 @@ Remember: You're speaking to someone on the phone. Be human, warm, and helpful."
         return prompt
     
     def _format_business_info(self, info: Dict) -> str:
-        """Format business info for the prompt"""
+        """Format business info for the prompt — this is what makes the
+        agent able to actually answer FAQ / catalog / policy questions
+        instead of improvising."""
         if not info:
             return "No specific business information available."
-        
+
         parts = []
-        if info.get("hours"):
-            parts.append(f"Hours: {info['hours']}")
-        if info.get("services"):
-            parts.append(f"Services: {', '.join(info['services'][:5])}")
         if info.get("description"):
             parts.append(f"About: {info['description']}")
-        if info.get("specials"):
-            parts.append(f"Current specials: {info['specials']}")
-        
+        if info.get("hours_today"):
+            parts.append(f"Today: {info['hours_today']}")
+        elif info.get("hours"):
+            parts.append(f"Hours: {info['hours']}")
+
+        catalog = info.get("catalog") or info.get("services") or []
+        if catalog:
+            listed = "\n".join(f"  - {item}" for item in list(catalog)[:12])
+            parts.append(f"Services offered (with prices/durations where known):\n{listed}")
+
+        specials = info.get("active_specials") or info.get("specials")
+        if specials:
+            if isinstance(specials, list):
+                specials = "; ".join(str(s) for s in specials)
+            parts.append(f"Current specials: {specials}")
+
+        faq = info.get("faq") or {}
+        if faq:
+            qa = "\n".join(f"  Q: {q}\n  A: {a}" for q, a in list(faq.items())[:10])
+            parts.append(
+                "Frequently asked questions — use these answers verbatim when "
+                f"they match what the caller is asking:\n{qa}"
+            )
+
+        if info.get("cancellation_policy"):
+            parts.append(f"Cancellation policy: {info['cancellation_policy']}")
+        if info.get("max_party_size"):
+            parts.append(f"Maximum party size: {info['max_party_size']}")
+
         return "\n".join(parts) if parts else "General business"
 
 

@@ -298,11 +298,26 @@ class IntelligentAgent:
     def update_context_with_business(self, context: ConversationContext, business_data: Dict):
         context.business_name = business_data.get("name", "")
         context.business_type = business_data.get("business_type", "")
-        context.business_knowledge = {
-            "hours": business_data.get("hours_of_operation", {}),
-            "services": business_data.get("services", []),
-            "description": business_data.get("description", "")
-        }
+        if not context.business_id and business_data.get("id"):
+            context.business_id = business_data["id"]
+
+        # Prefer the loaded knowledge base — it carries FAQ, catalog with
+        # prices/durations, policies, specials, capacity. Fall back to the
+        # raw business_data shape if no KB was created for this business.
+        from app.core.knowledge_base import knowledge_manager
+        kb = knowledge_manager.get_knowledge_base(context.business_id)
+        if kb:
+            context.business_knowledge = {
+                "hours": business_data.get("hours_of_operation", {}),
+                "description": business_data.get("description", "") or "",
+                **kb.to_context_dict(),
+            }
+        else:
+            context.business_knowledge = {
+                "hours": business_data.get("hours_of_operation", {}),
+                "services": business_data.get("services", []),
+                "description": business_data.get("description", "") or "",
+            }
     
     async def process_input(self, call_sid: str, user_text: str,
                            business_data: Optional[Dict] = None) -> Dict[str, Any]:
@@ -497,6 +512,16 @@ RULES:
             response_parts.append(self.tone_adapter.get_acknowledgment(tone, lang))
             response_parts.append(self.tone_adapter.get_transition(tone, lang))
         
+        # FAQ can answer questions regardless of how intent was classified
+        if intent in (IntentCategory.INQUIRY, IntentCategory.GENERAL, None):
+            from app.core.knowledge_base import knowledge_manager
+            kb = knowledge_manager.get_knowledge_base(context.business_id)
+            if kb:
+                faq_answer = kb.answer_faq(user_text)
+                if faq_answer:
+                    response_parts.append(faq_answer)
+                    return " ".join(filter(None, response_parts))
+
         # Intent-specific response
         if intent == IntentCategory.BOOKING:
             response_parts.append(self._booking_response(context))
@@ -537,17 +562,29 @@ RULES:
     
     def _inquiry_response(self, context: ConversationContext, text: str) -> str:
         text_lower = text.lower()
-        kb = context.business_knowledge
-        
+        knowledge = context.business_knowledge
+
+        # FAQ is the first stop for any inquiry
+        from app.core.knowledge_base import knowledge_manager
+        kb = knowledge_manager.get_knowledge_base(context.business_id)
+        if kb:
+            faq_answer = kb.answer_faq(text)
+            if faq_answer:
+                return faq_answer
+
         if any(w in text_lower for w in ["hour", "open", "close"]):
-            hours = kb.get("hours", {})
-            if hours:
-                return f"We're open during our regular hours. Is there a specific day you'd like to know about?"
+            hours_today = knowledge.get("hours_today")
+            if hours_today:
+                return hours_today
             return "Let me check our hours for you."
-        
-        if any(w in text_lower for w in ["menu", "serve", "food"]):
-            return "We have a great selection. What type of dish are you in the mood for?"
-        
+
+        if any(w in text_lower for w in ["price", "cost", "how much", "menu", "services", "offer"]):
+            catalog = knowledge.get("catalog") or []
+            if catalog:
+                listed = "; ".join(catalog[:4])
+                return f"Here's what we offer: {listed}. Would you like to book one of those?"
+            return "I'd be happy to go over what we offer. What are you looking for?"
+
         return "I'd be happy to help with that. Could you tell me more about what you're looking for?"
     
     def cleanup_context(self, call_sid: str):
