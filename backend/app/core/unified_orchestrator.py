@@ -67,6 +67,8 @@ class UnifiedAgentOrchestrator:
         # Get personalized greeting
         business_name = business_data.get("name", "our business") if business_data else "our business"
         greeting = conversation_manager.get_personalized_greeting(caller_number, business_name, initial_lang)
+
+        await self._persist(session)
         
         add_to_conversation(call_sid, "assistant", greeting)
         
@@ -76,6 +78,13 @@ class UnifiedAgentOrchestrator:
         """Process user speech and generate response"""
         
         session = self._sessions.get(call_sid)
+        if not session:
+            # Another instance handled earlier turns, or we restarted:
+            # hydrate the whole session from the persistent store.
+            from app.core import session_store
+            state = await session_store.load(call_sid)
+            if state:
+                session = session_store.hydrate_into_memory(call_sid, state)
         if not session:
             return {
                 "response": "I'm sorry, there seems to be a connection issue. Please call back.",
@@ -370,12 +379,31 @@ class UnifiedAgentOrchestrator:
         
         end_conversation(call_sid, outcome)
         intelligent_agent.cleanup_context(call_sid)
+
+        from app.core import session_store
+        await session_store.delete(call_sid)
         
         if call_sid in self._sessions:
             del self._sessions[call_sid]
     
     def get_session(self, call_sid: str) -> Optional[CallSession]:
         return self._sessions.get(call_sid)
+
+    async def _persist(self, session: CallSession) -> None:
+        """Write-through the session + agent context to agent_sessions."""
+        from app.core import session_store
+        context = intelligent_agent.contexts.get(session.call_sid)
+        if context is None:
+            # Greeting turn: no agent context yet — create it now so the
+            # very first persisted state is complete.
+            context = intelligent_agent.get_or_create_context(
+                session.call_sid, business_id=session.business_id,
+                caller_number=session.caller_number, language=session.language,
+            )
+            if session.business_data:
+                intelligent_agent.update_context_with_business(context, session.business_data)
+        state = session_store.serialize_state(session, context)
+        await session_store.save(session.call_sid, session.business_id or None, state)
 
 
 # Singleton
@@ -389,7 +417,11 @@ async def handle_incoming_call(call_sid: str, caller_number: str,
 
 
 async def process_speech(call_sid: str, user_text: str) -> Dict[str, Any]:
-    return await unified_orchestrator.process_user_input(call_sid, user_text)
+    result = await unified_orchestrator.process_user_input(call_sid, user_text)
+    session = unified_orchestrator.get_session(call_sid)
+    if session:
+        await unified_orchestrator._persist(session)
+    return result
 
 
 async def end_call(call_sid: str, outcome: str = "completed"):
